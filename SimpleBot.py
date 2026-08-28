@@ -263,6 +263,7 @@ class VisionItem:
 class VisionSnapshot:
     board_visible: bool
     result_visible: bool
+    error_visible: bool
     mulligan_visible: bool
     play_visible: bool
     turn_active: bool
@@ -557,22 +558,30 @@ class ScreenVision:
             + self._low_saturation_ratio(frame, "result_right_roi")
         ) / 2.0
         result_visible = result_gray >= float(self.config["result_gray_ratio"])
+        error_gray = self._low_saturation_ratio(frame, "error_dialog_roi")
+        error_visible = (
+            not result_visible
+            and error_gray >= float(self.config["error_dialog_gray_ratio"])
+        )
         board_visible = max(end_gold, end_green) >= float(
             self.config["board_button_color_ratio"]
         )
         mulligan_visible = (
             not result_visible
+            and not error_visible
             and not board_visible
             and mulligan_blue >= float(self.config["mulligan_color_ratio"])
         )
         return VisionSnapshot(
             board_visible=board_visible,
             result_visible=result_visible,
+            error_visible=error_visible,
             mulligan_visible=mulligan_visible,
             # The mana tray is also blue; never call it Play after the board is proven.
             play_visible=(
                 not board_visible
                 and not result_visible
+                and not error_visible
                 and not mulligan_visible
                 and blue_ratio >= float(self.config["play_color_ratio"])
             ),
@@ -617,6 +626,7 @@ class ScreenVision:
         state_text = (
             f"BOARD={int(snapshot.board_visible)} "
             f"RESULT={int(snapshot.result_visible)} "
+            f"ERROR={int(snapshot.error_visible)} "
             f"MULLIGAN={int(snapshot.mulligan_visible)} "
             f"PLAY={int(snapshot.play_visible)} "
             f"TURN={int(snapshot.turn_active)} "
@@ -895,6 +905,26 @@ class HearthstoneBot:
             # Do not sweep random target positions: one failed face attack is skipped.
             failed.append(attacker.center)
 
+    def _use_hero_power_if_available(self, area: ClientArea) -> bool:
+        frame, snapshot = self._vision_snapshot(area)
+        if not snapshot.board_visible:
+            return False
+        hero_power_ratio = self._vision.green_ratio_at_point(
+            frame,
+            self.config["points"]["hero_power"],
+            self.config["vision"]["hero_power_radius"],
+        )
+        if hero_power_ratio < float(
+            self.config["vision"]["hero_power_green_ratio"]
+        ):
+            return False
+
+        self._set_states(bot="Bot is running: using Hero Power")
+        LOGGER.info("Using the highlighted Hero Power")
+        self._click(self._point(area, "hero_power"))
+        self._sleep(float(self.config["vision"]["after_card_wait_seconds"]))
+        return True
+
     def _take_visual_turn(
         self,
         area: ClientArea,
@@ -907,121 +937,137 @@ class HearthstoneBot:
         if self._stop_event.is_set():
             return
 
-        frame, after_cards = self._vision_snapshot(area)
-        hero_power_ratio = self._vision.green_ratio_at_point(
-            frame,
-            self.config["points"]["hero_power"],
-            self.config["vision"]["hero_power_radius"],
-        )
-        if (
-            not after_cards.playable_cards
-            and hero_power_ratio
-            >= float(self.config["vision"]["hero_power_green_ratio"])
-        ):
-            self._set_states(bot="Bot is running: using Hero Power")
-            self._click(self._point(area, "hero_power"))
-            self._sleep(float(self.config["vision"]["after_card_wait_seconds"]))
-
+        # Try after cards and, if it was not available, once more after attacks.
+        # Remembering a successful click also avoids a second click during animation.
+        hero_power_used = self._use_hero_power_if_available(area)
+        if self._stop_event.is_set():
+            return
         self._attack_highlighted_characters(area)
-        if not self._stop_event.is_set():
-            self._set_states(bot="Bot is running: ending the turn")
+        if self._stop_event.is_set():
+            return
+        if not hero_power_used:
+            self._use_hero_power_if_available(area)
+        if self._stop_event.is_set():
+            return
+        self._set_states(bot="Bot is running: ending the turn")
+        self._click(
+            self._point(area, "end_turn"),
+            float(self.config["behavior"]["navigation_click_hold_seconds"]),
+        )
+        self._sleep(float(self.config["vision"]["after_end_turn_wait_seconds"]))
+
+    def _run_iteration(self) -> None:
+        game = self._ensure_game()
+        if game is None:
+            self._sleep(2.0)
+            return
+
+        _hwnd, area = game
+        frame, snapshot = self._vision_snapshot(area)
+
+        # The match-start error leaves the blue Play button visible behind a modal.
+        # Handle the gray dialog first so the background button is never clicked.
+        if snapshot.error_visible:
+            self._set_states(bot="Bot is running: closing an error dialog")
             self._click(
-                self._point(area, "end_turn"),
+                self._point(area, "error_ok"),
                 float(self.config["behavior"]["navigation_click_hold_seconds"]),
             )
-            self._sleep(float(self.config["vision"]["after_end_turn_wait_seconds"]))
+            self._next_actions_at = time.monotonic() + float(
+                self.config["vision"]["error_click_wait_seconds"]
+            )
+            LOGGER.info("Error dialog recognized; clicked OK")
+            return
+
+        handled = self._handle_screen_buttons(area)
+        if handled is not None:
+            if handled == "play":
+                self._set_states(bot="Bot is running: starting a match")
+                self._next_actions_at = time.monotonic() + float(
+                    self.config["vision"]["after_menu_click_wait_seconds"]
+                )
+            elif handled == "mulligan_confirm":
+                self._next_actions_at = time.monotonic() + float(
+                    self.config["behavior"]["mulligan_wait_seconds"]
+                )
+            return
+
+        now = time.monotonic()
+        if now < self._next_actions_at:
+            self._sleep(min(1.0, self._next_actions_at - now))
+            return
+
+        if snapshot.result_visible:
+            self._set_states(bot="Bot is running: closing the match result")
+            self._click(
+                self._point(area, "result_continue"),
+                float(self.config["behavior"]["navigation_click_hold_seconds"]),
+            )
+            self._next_actions_at = time.monotonic() + float(
+                self.config["vision"]["result_click_wait_seconds"]
+            )
+            LOGGER.info("Result or rank screen was recognized and closed")
+            return
+
+        if snapshot.mulligan_visible:
+            self._set_states(bot="Bot is running: confirming the starting hand")
+            self._click(
+                self._point(area, "mulligan_confirm"),
+                float(self.config["behavior"]["navigation_click_hold_seconds"]),
+            )
+            self._next_actions_at = time.monotonic() + float(
+                self.config["behavior"]["mulligan_wait_seconds"]
+            )
+            LOGGER.info("Starting-hand screen recognized; clicked OK")
+            return
+
+        if snapshot.play_visible:
+            self._set_states(bot="Bot is running: Play button detected")
+            self._click(
+                self._point(area, "play"),
+                float(self.config["behavior"]["navigation_click_hold_seconds"]),
+            )
+            self._next_actions_at = time.monotonic() + float(
+                self.config["vision"]["after_menu_click_wait_seconds"]
+            )
+            LOGGER.info("Play button recognized by its blue glow")
+            return
+
+        template_turn = self._matcher.installed("end_turn") and (
+            self._matcher.locate("end_turn", area) is not None
+        )
+        # Green decorations also exist in menus. The End Turn button first proves
+        # this is a board; a green object or green button then proves action.
+        if snapshot.board_visible and (
+            snapshot.playable_cards
+            or snapshot.attackers
+            or snapshot.turn_active
+            or template_turn
+        ):
+            self._take_visual_turn(area, frame, snapshot)
+        else:
+            self._set_states(bot="Bot is running: waiting for a recognized screen")
+        self._sleep(float(self.config["vision"]["scan_interval_seconds"]))
 
     def _run(self) -> None:
         pyautogui.PAUSE = 0.01
-        pyautogui.FAILSAFE = True
+        # Ctrl+C is the deliberate emergency stop. Disabling the corner fail-safe
+        # prevents a normal user mouse movement from killing the worker thread.
+        pyautogui.FAILSAFE = False
         try:
             while not self._stop_event.is_set():
-                game = self._ensure_game()
-                if game is None:
-                    if self._sleep(2.0):
+                try:
+                    self._run_iteration()
+                except Exception:
+                    LOGGER.exception("Bot iteration failed; waiting before retry")
+                    self._set_states(bot="Bot is running: temporary error, waiting")
+                    if self._sleep(
+                        float(self.config["behavior"]["error_retry_seconds"])
+                    ):
                         break
-                    continue
-
-                _hwnd, area = game
-                handled = self._handle_screen_buttons(area)
-                if handled is not None:
-                    if handled == "play":
-                        self._set_states(bot="Bot is running: starting a match")
-                        self._next_actions_at = time.monotonic() + float(
-                            self.config["vision"]["after_menu_click_wait_seconds"]
-                        )
-                    elif handled == "mulligan_confirm":
-                        self._next_actions_at = time.monotonic() + float(
-                            self.config["behavior"]["mulligan_wait_seconds"]
-                        )
-                    continue
-
-                now = time.monotonic()
-                if now < self._next_actions_at:
-                    self._sleep(min(1.0, self._next_actions_at - now))
-                    continue
-
-                frame, snapshot = self._vision_snapshot(area)
-                if snapshot.result_visible:
-                    self._set_states(bot="Bot is running: closing the match result")
-                    self._click(
-                        self._point(area, "result_continue"),
-                        float(self.config["behavior"]["navigation_click_hold_seconds"]),
-                    )
-                    self._next_actions_at = time.monotonic() + float(
-                        self.config["vision"]["result_click_wait_seconds"]
-                    )
-                    LOGGER.info("Result or rank screen was recognized and closed")
-                    continue
-
-                if snapshot.mulligan_visible:
-                    self._set_states(bot="Bot is running: confirming the starting hand")
-                    self._click(
-                        self._point(area, "mulligan_confirm"),
-                        float(self.config["behavior"]["navigation_click_hold_seconds"]),
-                    )
-                    self._next_actions_at = time.monotonic() + float(
-                        self.config["behavior"]["mulligan_wait_seconds"]
-                    )
-                    LOGGER.info("Starting-hand screen recognized; clicked OK")
-                    continue
-
-                if snapshot.play_visible:
-                    self._set_states(bot="Bot is running: Play button detected")
-                    self._click(
-                        self._point(area, "play"),
-                        float(self.config["behavior"]["navigation_click_hold_seconds"]),
-                    )
-                    self._next_actions_at = time.monotonic() + float(
-                        self.config["vision"]["after_menu_click_wait_seconds"]
-                    )
-                    LOGGER.info("Play button recognized by its blue glow")
-                    continue
-
-                template_turn = self._matcher.installed("end_turn") and (
-                    self._matcher.locate("end_turn", area) is not None
-                )
-                # Green decorations also exist in menus. The End Turn button first
-                # proves this is a board; a green object or green button proves action.
-                if snapshot.board_visible and (
-                    snapshot.playable_cards
-                    or snapshot.attackers
-                    or snapshot.turn_active
-                    or template_turn
-                ):
-                    self._take_visual_turn(area, frame, snapshot)
-                else:
-                    self._set_states(bot="Bot is running: waiting for a recognized screen")
-                self._sleep(float(self.config["vision"]["scan_interval_seconds"]))
-        except pyautogui.FailSafeException:
-            LOGGER.warning("PyAutoGUI fail-safe was triggered")
-            self._set_states(bot="Bot is stopped (fail-safe)")
-        except Exception:
-            LOGGER.exception("Unhandled error in the worker thread")
-            self._set_states(bot="Bot error — see hs_bot.log")
         finally:
             self._stop_event.set()
-            if self.states()[1] == "Bot is running":
+            if self.states()[1].startswith("Bot is running"):
                 self._set_states(bot="Bot is stopped")
 
 

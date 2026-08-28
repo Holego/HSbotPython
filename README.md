@@ -10,7 +10,8 @@ A simple computer-vision bot for Hearthstone on Windows. It can:
 - find the green glow around playable cards and play only detected cards;
 - find highlighted minions, use an available Hero Power, and finish the active turn;
 - end turns, start the next match, and handle disconnect dialogs;
-- stop through the **Stop** button, the global `Ctrl+C` hotkey, or PyAutoGUI's top-left-corner fail-safe.
+- close the match-start error dialog by clicking its `OK` button;
+- stop through the **Stop** button or the global `Ctrl+C` hotkey.
 
 This is a screen bot, not a game-playing AI. It makes decisions from colors and templates in screenshots of the game client. It does not read game memory and does not guarantee optimal plays. Game automation may violate the game's rules and could result in account penalties. Use it at your own risk.
 
@@ -52,15 +53,15 @@ The `vision` section in `bot_config.json` controls recognition:
 - `green_hsv` — the green glow around playable cards and available minions;
 - `blue_hsv` — the blue glow around the **Play** button;
 - `gold_hsv` — the active golden **End Turn** button;
-- `hand_roi`, `own_board_roi`, `play_roi`, `mulligan_roi`, and `end_turn_roi` — search regions;
-- `play_color_ratio`, `board_button_color_ratio`, and `end_turn_green_ratio` — minimum ratios of matching pixels;
+- `hand_roi`, `own_board_roi`, `play_roi`, `mulligan_roi`, `error_dialog_roi`, and `end_turn_roi` — search regions;
+- `play_color_ratio`, `error_dialog_gray_ratio`, `board_button_color_ratio`, and `end_turn_green_ratio` — minimum ratios of matching pixels;
 - `max_cards_per_turn` and `max_attacks_per_turn` — safeguards against endless repeated actions.
 
 The bot first checks for the End Turn button to distinguish the game board from menus. It then acts only when it sees a green card, a green minion, or the green End Turn button. A golden button alone does not start the turn logic because it may remain visible during an opponent's animation.
 
-After detecting a card, the bot performs one drag to the board. It does not press `Esc`, select random targets, or iterate over a fixed hand grid. Hero Power is clicked only when no green cards remain and the ability itself has a recognized green active glow.
+After detecting a card, the bot performs one drag to the board. It does not press `Esc`, select random targets, or iterate over a fixed hand grid. The bot checks for a green active Hero Power after playing cards and checks again after attacking, so remaining mana is used more consistently.
 
-Cards are played from left to right. Match-result and rank screens are detected separately, receive one click each, and never trigger a blind sequence of menu clicks.
+Cards are played from left to right. Match-result and rank screens are detected separately, receive one click each, and never trigger a blind sequence of menu clicks. A gray match-start error dialog is handled before the blue Play button behind it. Unknown screens cause no clicks, and recoverable iteration errors make the bot wait and retry instead of stopping its worker thread.
 
 While the bot runs, it overwrites `debug_last.png`. Green `CARD` boxes mark detected cards and yellow `ATTACK` boxes mark detected attackers. The top line shows the scene classification. If recognition fails, stop the bot and inspect this image to tune the HSV thresholds accurately.
 
