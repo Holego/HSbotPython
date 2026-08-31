@@ -3,12 +3,13 @@
 A simple computer-vision bot for Hearthstone on Windows. It can:
 
 - find, restore, and bring the Hearthstone window to the foreground;
-- launch the game through Battle.net when `Hearthstone.exe` is not found;
+- launch the game through Battle.net when `Hearthstone.exe` is not found (enabled by default in the GUI);
+- recognize the four-button main menu and open **Hearthstone** mode;
 - recognize the blue glow around the **Play** button and click it only on the appropriate screen;
 - recognize the starting-hand screen and click only its blue `OK` button;
 - recognize match-result and rank screens separately by their desaturated backgrounds;
 - find the green glow around playable cards and play only detected cards;
-- find highlighted minions, use an available Hero Power, and finish the active turn;
+- find fully highlighted minions, attack Taunt minions before the enemy hero, use an available Hero Power, and finish the active turn;
 - end turns, start the next match, and handle disconnect dialogs;
 - close the match-start error dialog by clicking its `OK` button;
 - stop through the **Stop** button or the global `Ctrl+C` hotkey.
@@ -37,12 +38,15 @@ All coordinates in `bot_config.json` are relative. `[0, 0]` is the top-left corn
 Important points:
 
 - `play` — starts a match;
+- `main_menu_hearthstone` — opens Hearthstone mode from the main menu;
 - `mulligan_confirm` — confirms the starting hand;
 - `result_continue` — a safe continuation point on result and rank screens;
 - `board_play` — the destination for cards dragged from the hand;
 - `enemy_hero`, `hero_power`, and `end_turn` — the corresponding game elements.
 
 Click duration is controlled by `click_hold_seconds` and `navigation_click_hold_seconds`. Menu buttons use the longer hold duration. Drag speed and the delays before and after dragging are controlled by `drag_duration`, `drag_hold_before_seconds`, and `drag_hold_after_seconds`.
+
+Input is intentionally not pixel-perfect. `timing_jitter_fraction` varies movement, hold, and action timing on every input. `click_jitter_ratio`, `drag_source_jitter_ratio`, and `drag_target_jitter_ratio` add small resolution-relative coordinate offsets while keeping the pointer inside the game client. Card and attack drags follow a smooth, slightly curved path controlled by `drag_curve_min_ratio`, `drag_curve_ratio`, `drag_steps_min`, `drag_steps_max`, and `drag_step_noise_pixels`. Keep these values small: excessive variation can miss narrow buttons or card targets.
 
 If the client uses a nonstandard scale, adjust these values. The initial configuration was calibrated against a client area close to 1600×900.
 
@@ -51,19 +55,20 @@ If the client uses a nonstandard scale, adjust these values. The initial configu
 The `vision` section in `bot_config.json` controls recognition:
 
 - `green_hsv` — the green glow around playable cards and available minions;
+- `taunt_shield_hsv` — the cool-gray lower shield on enemy Taunt minions;
 - `blue_hsv` — the blue glow around the **Play** button;
 - `gold_hsv` — the active golden **End Turn** button;
-- `hand_roi`, `own_board_roi`, `play_roi`, `mulligan_roi`, `error_dialog_roi`, and `end_turn_roi` — search regions;
+- `hand_roi`, `own_board_roi`, `enemy_taunt_roi`, `play_roi`, `mulligan_roi`, `error_dialog_roi`, and `end_turn_roi` — search regions;
 - `play_color_ratio`, `error_dialog_gray_ratio`, `board_button_color_ratio`, and `end_turn_green_ratio` — minimum ratios of matching pixels;
 - `max_cards_per_turn` and `max_attacks_per_turn` — safeguards against endless repeated actions.
 
-The bot first checks for the End Turn button to distinguish the game board from menus. It then acts only when it sees a green card, a green minion, or the green End Turn button. A golden button alone does not start the turn logic because it may remain visible during an opponent's animation.
+The bot first checks for the End Turn button to distinguish the game board from menus. A broader warm-color check is used only as a fallback for board themes whose yellow button is not covered by the strict gold range; it never authorizes an End Turn click. The bot then acts only when it sees a green card, a green minion, or the green End Turn button. A yellow button alone does not start the turn logic because useful actions may still exist. After cards, Hero Power, and attacks, the bot captures a fresh frame and clicks End Turn only when the button is green; if it remains yellow, the bot returns to scanning for more actions.
 
-After detecting a card, the bot performs one drag to the board. It does not press `Esc`, select random targets, or iterate over a fixed hand grid. The bot checks for a green active Hero Power after playing cards and checks again after attacking, so remaining mana is used more consistently.
+After detecting a card, the bot performs one drag to the board. It does not press `Esc`, select random targets, or iterate over a fixed hand grid. A minion is considered attack-ready only when the detected green region is large and tall enough to represent the complete outer glow; green artwork inside a minion is ignored. When adjacent attack glows merge into one wide contour, the contour is split into individual minion targets using their expected spacing. Immediately before every attack, the bot captures a fresh frame and targets the leftmost detected Taunt minion, falling back to the enemy hero only when no Taunt shield is visible. Actions use a strict priority: playable cards, available minion attacks, Hero Power only when no playable green card remains, and finally a green End Turn button.
 
 Cards are played from left to right. Match-result and rank screens are detected separately, receive one click each, and never trigger a blind sequence of menu clicks. A gray match-start error dialog is handled before the blue Play button behind it. Unknown screens cause no clicks, and recoverable iteration errors make the bot wait and retry instead of stopping its worker thread.
 
-While the bot runs, it overwrites `debug_last.png`. Green `CARD` boxes mark detected cards and yellow `ATTACK` boxes mark detected attackers. The top line shows the scene classification. If recognition fails, stop the bot and inspect this image to tune the HSV thresholds accurately.
+While the bot runs, it overwrites `debug_last.png`. Green `CARD` boxes mark detected cards, yellow `ATTACK` boxes mark detected attackers, and blue `TAUNT` boxes mark detected Taunt shields. The top line shows the scene classification. If recognition fails, stop the bot and inspect this image to tune the HSV thresholds accurately.
 
 ## Button templates (recommended)
 
@@ -81,6 +86,8 @@ Capture these images at the same Windows and Hearthstone scale that the bot will
 Without `play.png`, the bot recognizes the Play button by its blue glow. Templates are still recommended for disconnect dialogs, the starting-hand confirmation, and post-match screens because the bot clicks them only when the corresponding image is actually found.
 
 ## Automatic game launch
+
+The **Auto-launch Hearthstone** checkbox is enabled by default. While the bot is running, it relaunches the game if `Hearthstone.exe` closes. Clear the checkbox to keep the bot waiting without launching the game.
 
 The default launch URI is `battlenet://WTCG`. If it does not work, set the full executable path in the `game.executable` field of `bot_config.json`.
 

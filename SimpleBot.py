@@ -4,7 +4,9 @@ import ctypes
 import ctypes.wintypes
 import json
 import logging
+import math
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -261,6 +263,7 @@ class VisionItem:
 
 @dataclass(frozen=True)
 class VisionSnapshot:
+    main_menu_visible: bool
     board_visible: bool
     result_visible: bool
     error_visible: bool
@@ -269,6 +272,7 @@ class VisionSnapshot:
     turn_active: bool
     playable_cards: tuple[VisionItem, ...]
     attackers: tuple[VisionItem, ...]
+    taunts: tuple[VisionItem, ...]
 
 
 class ScreenVision:
@@ -313,6 +317,79 @@ class ScreenVision:
         threshold = int(self.config["result_gray_saturation_max"])
         return float(np.mean(hsv[:, :, 1] <= threshold))
 
+    def _main_menu_visible(self, frame: np.ndarray) -> bool:
+        """Recognize the four pale horizontal mode buttons on the main menu."""
+        roi, _bounds = self._roi_pixels(frame, self.config["main_menu_roi"])
+        mask = self._hsv_mask(roi, self.config["main_menu_button_hsv"])
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            np.ones((7, 13), dtype=np.uint8),
+            iterations=2,
+        )
+        contours, _hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        frame_height, frame_width = frame.shape[:2]
+        buttons = 0
+        for contour in contours:
+            _x, _y, width, height = cv2.boundingRect(contour)
+            if (
+                frame_width * float(self.config["main_menu_button_min_width_ratio"])
+                <= width
+                <= frame_width
+                * float(self.config["main_menu_button_max_width_ratio"])
+                and frame_height
+                * float(self.config["main_menu_button_min_height_ratio"])
+                <= height
+                <= frame_height
+                * float(self.config["main_menu_button_max_height_ratio"])
+                and width / max(1, height)
+                >= float(self.config["main_menu_button_min_aspect_ratio"])
+                and cv2.contourArea(contour)
+                >= frame_width
+                * frame_height
+                * float(self.config["main_menu_button_min_area_ratio"])
+            ):
+                buttons += 1
+        return buttons >= int(self.config["main_menu_min_button_count"])
+
+    def _has_outer_attack_glow(
+        self,
+        frame: np.ndarray,
+        area: ClientArea,
+        item: VisionItem,
+    ) -> bool:
+        """Reject green card art unless green pixels form a minion-sized rim."""
+        frame_height, frame_width = frame.shape[:2]
+        left = max(0, item.box[0] - area.left)
+        top = max(0, item.box[1] - area.top)
+        right = min(frame_width, left + item.box[2])
+        bottom = min(frame_height, top + item.box[3])
+        crop = frame[top:bottom, left:right]
+        if crop.size == 0:
+            return False
+
+        mask = self._hsv_mask(crop, self.config["green_hsv"])
+        height, width = mask.shape[:2]
+        thickness = max(
+            1,
+            round(
+                min(height, width)
+                * float(self.config["attacker_border_thickness_ratio"])
+            ),
+        )
+        if height <= 2 * thickness or width <= 2 * thickness:
+            return False
+
+        inner = mask[thickness : height - thickness, thickness : width - thickness]
+        border_pixels = cv2.countNonZero(mask) - cv2.countNonZero(inner)
+        border_area = mask.size - inner.size
+        border_ratio = border_pixels / max(1, border_area)
+        return border_ratio >= float(
+            self.config["attacker_min_border_green_ratio"]
+        )
+
     def _green_items(
         self,
         frame: np.ndarray,
@@ -343,6 +420,7 @@ class ScreenVision:
         min_area = frame_width * frame_height * float(self.config["item_min_area_ratio"])
         candidates: list[VisionItem] = []
         generated_hand_items: list[VisionItem] = []
+        generated_board_items: list[VisionItem] = []
         wide_hand_spans: list[tuple[int, int]] = []
 
         for contour in contours:
@@ -351,6 +429,52 @@ class ScreenVision:
             valid_height_and_area = (
                 min_height <= height <= max_height and contour_area >= min_area
             )
+            if (
+                roi_name == "own_board_roi"
+                and valid_height_and_area
+                and width
+                > frame_width * float(self.config["attacker_group_min_width_ratio"])
+                and width
+                <= frame_width * float(self.config["attacker_group_max_width_ratio"])
+            ):
+                absolute_left = area.left + offset_x + x
+                margin = frame_width * float(
+                    self.config["attacker_group_margin_ratio"]
+                )
+                spacing = frame_width * float(
+                    self.config["attacker_spacing_ratio"]
+                )
+                usable_width = max(0.0, width - 2.0 * margin)
+                attacker_count = max(
+                    2,
+                    round(usable_width / max(1.0, spacing)) + 1,
+                )
+                first_center = absolute_left + margin
+                last_center = absolute_left + width - margin
+                centers = [
+                    first_center
+                    + (last_center - first_center) * index / (attacker_count - 1)
+                    for index in range(attacker_count)
+                ]
+                debug_width = round(
+                    frame_width * float(self.config["attacker_debug_width_ratio"])
+                )
+                for center_x in centers:
+                    generated_board_items.append(
+                        VisionItem(
+                            center=(
+                                round(center_x),
+                                area.top + offset_y + y + height // 2,
+                            ),
+                            box=(
+                                round(center_x - debug_width / 2),
+                                area.top + offset_y + y,
+                                debug_width,
+                                height,
+                            ),
+                        )
+                    )
+                continue
             if (
                 roi_name == "hand_roi"
                 and valid_height_and_area
@@ -427,6 +551,9 @@ class ScreenVision:
                 if not any(left <= item.center[0] <= right for left, right in wide_hand_spans)
             ]
             candidates.extend(generated_hand_items)
+
+        if generated_board_items:
+            candidates.extend(generated_board_items)
 
         # Nearby fragments of one glow are collapsed to one click target.
         candidates.sort(key=lambda item: item.center[0])
@@ -533,7 +660,82 @@ class ScreenVision:
                     merged[-1] = candidate
             else:
                 merged.append(candidate)
+        if roi_name == "own_board_roi":
+            min_attack_width = frame_width * float(
+                self.config["attacker_min_width_ratio"]
+            )
+            min_attack_height = frame_height * float(
+                self.config["attacker_min_height_ratio"]
+            )
+            min_attack_aspect = float(self.config["attacker_min_aspect_ratio"])
+            merged = [
+                item
+                for item in merged
+                if item.box[2] >= min_attack_width
+                and item.box[3] >= min_attack_height
+                and item.box[3] / max(1, item.box[2]) >= min_attack_aspect
+                and self._has_outer_attack_glow(frame, area, item)
+            ]
+
         return tuple(merged)
+
+    def _taunt_targets(
+        self,
+        frame: np.ndarray,
+        area: ClientArea,
+    ) -> tuple[VisionItem, ...]:
+        """Find the cool-gray lower shield used by enemy Taunt minions."""
+        roi, (offset_x, offset_y, _right, _bottom) = self._roi_pixels(
+            frame, self.config["enemy_taunt_roi"]
+        )
+        mask = self._hsv_mask(roi, self.config["taunt_shield_hsv"])
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            np.ones((7, 7), dtype=np.uint8),
+            iterations=2,
+        )
+        mask = cv2.dilate(mask, np.ones((5, 5), dtype=np.uint8), iterations=1)
+        contours, _hierarchy = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        frame_height, frame_width = frame.shape[:2]
+        min_width = frame_width * float(self.config["taunt_min_width_ratio"])
+        max_width = frame_width * float(self.config["taunt_max_width_ratio"])
+        min_height = frame_height * float(self.config["taunt_min_height_ratio"])
+        max_height = frame_height * float(self.config["taunt_max_height_ratio"])
+        min_area = frame_width * frame_height * float(
+            self.config["taunt_min_area_ratio"]
+        )
+        target_y = area.top + round(
+            area.height * float(self.config["enemy_minion_target_y_ratio"])
+        )
+        targets: list[VisionItem] = []
+
+        for contour in contours:
+            x, y, width, height = cv2.boundingRect(contour)
+            if not (
+                min_width <= width <= max_width
+                and min_height <= height <= max_height
+                and cv2.contourArea(contour) >= min_area
+            ):
+                continue
+            absolute_box = (
+                area.left + offset_x + x,
+                area.top + offset_y + y,
+                width,
+                height,
+            )
+            targets.append(
+                VisionItem(
+                    center=(absolute_box[0] + width // 2, target_y),
+                    box=absolute_box,
+                )
+            )
+
+        targets.sort(key=lambda item: item.center[0])
+        return tuple(targets)
 
     def green_ratio_at_point(
         self,
@@ -549,10 +751,12 @@ class ScreenVision:
         return float(cv2.countNonZero(mask)) / float(mask.shape[0] * mask.shape[1])
 
     def analyze(self, frame: np.ndarray, area: ClientArea) -> VisionSnapshot:
+        main_menu_visible = self._main_menu_visible(frame)
         blue_ratio = self._color_ratio(frame, "play_roi", "blue_hsv")
         mulligan_blue = self._color_ratio(frame, "mulligan_roi", "blue_hsv")
         end_gold = self._color_ratio(frame, "end_turn_roi", "gold_hsv")
         end_green = self._color_ratio(frame, "end_turn_roi", "green_hsv")
+        end_warm = self._color_ratio(frame, "end_turn_roi", "end_button_hsv")
         result_gray = (
             self._low_saturation_ratio(frame, "result_left_roi")
             + self._low_saturation_ratio(frame, "result_right_roi")
@@ -563,16 +767,29 @@ class ScreenVision:
             not result_visible
             and error_gray >= float(self.config["error_dialog_gray_ratio"])
         )
-        board_visible = max(end_gold, end_green) >= float(
-            self.config["board_button_color_ratio"]
+        playable_cards = self._green_items(frame, area, "hand_roi")
+        attackers = self._green_items(frame, area, "own_board_roi")
+        board_visible = (
+            not main_menu_visible
+            and (
+                max(end_gold, end_green)
+                >= float(self.config["board_button_color_ratio"])
+                or (
+                    end_warm >= float(self.config["end_turn_warm_ratio"])
+                    and blue_ratio < float(self.config["play_color_ratio"])
+                )
+            )
         )
         mulligan_visible = (
             not result_visible
             and not error_visible
             and not board_visible
+            and not playable_cards
+            and not attackers
             and mulligan_blue >= float(self.config["mulligan_color_ratio"])
         )
         return VisionSnapshot(
+            main_menu_visible=main_menu_visible,
             board_visible=board_visible,
             result_visible=result_visible,
             error_visible=error_visible,
@@ -587,8 +804,9 @@ class ScreenVision:
             ),
             turn_active=end_green
             >= float(self.config["end_turn_green_ratio"]),
-            playable_cards=self._green_items(frame, area, "hand_roi"),
-            attackers=self._green_items(frame, area, "own_board_roi"),
+            playable_cards=playable_cards,
+            attackers=attackers,
+            taunts=(self._taunt_targets(frame, area) if board_visible else ()),
         )
 
     def save_debug(
@@ -603,6 +821,7 @@ class ScreenVision:
         for item, label, color in (
             *((item, "CARD", (0, 255, 0)) for item in snapshot.playable_cards),
             *((item, "ATTACK", (0, 220, 255)) for item in snapshot.attackers),
+            *((item, "TAUNT", (255, 120, 0)) for item in snapshot.taunts),
         ):
             x, y, width, height = item.box
             local_x = x - area.left
@@ -624,13 +843,15 @@ class ScreenVision:
                 2,
             )
         state_text = (
+            f"MAIN={int(snapshot.main_menu_visible)} "
             f"BOARD={int(snapshot.board_visible)} "
             f"RESULT={int(snapshot.result_visible)} "
             f"ERROR={int(snapshot.error_visible)} "
             f"MULLIGAN={int(snapshot.mulligan_visible)} "
             f"PLAY={int(snapshot.play_visible)} "
             f"TURN={int(snapshot.turn_active)} "
-            f"CARDS={len(snapshot.playable_cards)} ATTACKERS={len(snapshot.attackers)}"
+            f"CARDS={len(snapshot.playable_cards)} "
+            f"ATTACKERS={len(snapshot.attackers)} TAUNTS={len(snapshot.taunts)}"
         )
         cv2.putText(
             debug,
@@ -662,6 +883,9 @@ class HearthstoneBot:
         self._vision = ScreenVision(config["vision"])
         self._last_launch_attempt = 0.0
         self._next_actions_at = 0.0
+        self._next_idle_click_at = 0.0
+        self._auto_launch = bool(config["game"].get("auto_launch", True))
+        self._blocked_attackers: dict[int, float] = {}
 
     @property
     def running(self) -> bool:
@@ -670,6 +894,11 @@ class HearthstoneBot:
     def states(self) -> tuple[str, str]:
         with self._state_lock:
             return self._game_state, self._bot_state
+
+    def set_auto_launch(self, enabled: bool) -> None:
+        with self._state_lock:
+            self._auto_launch = bool(enabled)
+        LOGGER.info("Automatic game launch %s", "enabled" if enabled else "disabled")
 
     def _set_states(self, game: str | None = None, bot: str | None = None) -> None:
         with self._state_lock:
@@ -684,6 +913,8 @@ class HearthstoneBot:
             return
         self._stop_event.clear()
         self._next_actions_at = 0.0
+        self._next_idle_click_at = 0.0
+        self._blocked_attackers.clear()
         self._thread = threading.Thread(target=self._run, name="hs-bot", daemon=True)
         self._thread.start()
         self._set_states(bot="Bot is running")
@@ -742,6 +973,11 @@ class HearthstoneBot:
 
     def _ensure_game(self) -> tuple[int, ClientArea] | None:
         if not self._process_running():
+            with self._state_lock:
+                auto_launch = self._auto_launch
+            if not auto_launch:
+                self._set_states(game="Game is not running — auto-launch is off")
+                return None
             self._set_states(game="Game is not running — starting it...")
             retry = float(self.config["behavior"]["launch_retry_seconds"])
             if time.monotonic() - self._last_launch_attempt >= retry:
@@ -763,8 +999,31 @@ class HearthstoneBot:
         self._set_states(game="Game is running")
         return hwnd, area
 
+    def _varied_time(self, seconds: float) -> float:
+        variation = float(self.config["behavior"]["timing_jitter_fraction"])
+        return max(0.0, seconds * random.uniform(1.0 - variation, 1.0 + variation))
+
+    @staticmethod
+    def _jitter_point(
+        area: ClientArea,
+        point: tuple[int, int],
+        relative_jitter: Iterable[float],
+    ) -> tuple[int, int]:
+        jitter_x, jitter_y = [float(value) for value in relative_jitter]
+        offset_x = round(random.uniform(-area.width * jitter_x, area.width * jitter_x))
+        offset_y = round(random.uniform(-area.height * jitter_y, area.height * jitter_y))
+        return (
+            max(area.left, min(area.left + area.width - 1, point[0] + offset_x)),
+            max(area.top, min(area.top + area.height - 1, point[1] + offset_y)),
+        )
+
     def _point(self, area: ClientArea, name: str) -> tuple[int, int]:
-        return area.point(self.config["points"][name])
+        exact = area.point(self.config["points"][name])
+        return self._jitter_point(
+            area,
+            exact,
+            self.config["behavior"]["click_jitter_ratio"],
+        )
 
     def _click(self, point: tuple[int, int], hold_seconds: float | None = None) -> None:
         if self._stop_event.is_set():
@@ -775,29 +1034,118 @@ class HearthstoneBot:
             if hold_seconds is not None
             else float(behavior["click_hold_seconds"])
         )
-        pyautogui.moveTo(*point, duration=float(behavior["move_duration"]))
+        pyautogui.moveTo(
+            *point,
+            duration=self._varied_time(float(behavior["move_duration"])),
+        )
         pyautogui.mouseDown(button="left")
         try:
-            self._sleep(hold)
+            self._sleep(self._varied_time(hold))
         finally:
             # Never leave the mouse button held when Ctrl+C is pressed mid-click.
             pyautogui.mouseUp(button="left")
-        self._sleep(float(self.config["behavior"]["action_delay"]))
+        self._sleep(self._varied_time(float(behavior["action_delay"])))
 
-    def _drag(self, source: tuple[int, int], target: tuple[int, int]) -> None:
+    def _move_along_drag_curve(
+        self,
+        source: tuple[int, int],
+        target: tuple[int, int],
+        duration: float,
+        area: ClientArea,
+    ) -> bool:
+        behavior = self.config["behavior"]
+        delta_x = target[0] - source[0]
+        delta_y = target[1] - source[1]
+        distance = max(1.0, math.hypot(delta_x, delta_y))
+        perpendicular_x = -delta_y / distance
+        perpendicular_y = delta_x / distance
+        curve = (
+            distance
+            * random.uniform(
+                float(behavior["drag_curve_min_ratio"]),
+                float(behavior["drag_curve_ratio"]),
+            )
+            * random.choice((-1.0, 1.0))
+        )
+        control = (
+            (source[0] + target[0]) / 2.0 + perpendicular_x * curve,
+            (source[1] + target[1]) / 2.0 + perpendicular_y * curve,
+        )
+        steps = random.randint(
+            int(behavior["drag_steps_min"]),
+            int(behavior["drag_steps_max"]),
+        )
+        step_delay = self._varied_time(duration) / max(1, steps)
+        noise = float(behavior["drag_step_noise_pixels"])
+
+        for step in range(1, steps + 1):
+            if self._stop_event.is_set():
+                return False
+            progress = step / steps
+            eased = progress * progress * (3.0 - 2.0 * progress)
+            inverse = 1.0 - eased
+            noise_scale = math.sin(math.pi * eased)
+            x = (
+                inverse * inverse * source[0]
+                + 2.0 * inverse * eased * control[0]
+                + eased * eased * target[0]
+                + random.uniform(-noise, noise) * noise_scale
+            )
+            y = (
+                inverse * inverse * source[1]
+                + 2.0 * inverse * eased * control[1]
+                + eased * eased * target[1]
+                + random.uniform(-noise, noise) * noise_scale
+            )
+            bounded_x = max(area.left, min(area.left + area.width - 1, round(x)))
+            bounded_y = max(area.top, min(area.top + area.height - 1, round(y)))
+            pyautogui.moveTo(bounded_x, bounded_y)
+            if self._sleep(step_delay):
+                return False
+        return True
+
+    def _drag(
+        self,
+        source: tuple[int, int],
+        target: tuple[int, int],
+        area: ClientArea,
+    ) -> None:
         if self._stop_event.is_set():
             return
         behavior = self.config["behavior"]
-        pyautogui.moveTo(*source, duration=float(behavior["move_duration"]))
+        source = self._jitter_point(
+            area,
+            source,
+            behavior["drag_source_jitter_ratio"],
+        )
+        target = self._jitter_point(
+            area,
+            target,
+            behavior["drag_target_jitter_ratio"],
+        )
+        pyautogui.moveTo(
+            *source,
+            duration=self._varied_time(float(behavior["move_duration"])),
+        )
         pyautogui.mouseDown(button="left")
         try:
-            if self._sleep(float(behavior["drag_hold_before_seconds"])):
+            if self._sleep(
+                self._varied_time(float(behavior["drag_hold_before_seconds"]))
+            ):
                 return
-            pyautogui.moveTo(*target, duration=float(behavior["drag_duration"]))
-            self._sleep(float(behavior["drag_hold_after_seconds"]))
+            if not self._move_along_drag_curve(
+                source,
+                target,
+                float(behavior["drag_duration"]),
+                area,
+            ):
+                return
+            self._sleep(
+                self._varied_time(float(behavior["drag_hold_after_seconds"]))
+            )
         finally:
             pyautogui.mouseUp(button="left")
-        self._sleep(float(behavior["action_delay"]))
+        self._sleep(self._varied_time(float(behavior["action_delay"])))
 
     def _handle_screen_buttons(self, area: ClientArea) -> str | None:
         behavior = self.config["behavior"]
@@ -805,8 +1153,10 @@ class HearthstoneBot:
             if self._matcher.click_if_found(
                 name,
                 area,
-                hold_seconds=float(behavior["navigation_click_hold_seconds"]),
-                move_duration=float(behavior["move_duration"]),
+                hold_seconds=self._varied_time(
+                    float(behavior["navigation_click_hold_seconds"])
+                ),
+                move_duration=self._varied_time(float(behavior["move_duration"])),
             ):
                 self._sleep(float(self.config["behavior"]["screen_change_wait"]))
                 return name
@@ -857,7 +1207,7 @@ class HearthstoneBot:
             before_count = len(snapshot.playable_cards)
             self._set_states(bot=f"Bot is running: playing a card ({before_count})")
             LOGGER.info("Dragging a card: %s -> %s", card.center, board)
-            self._drag(card.center, board)
+            self._drag(card.center, board, area)
             self._sleep(float(vision_config["after_card_wait_seconds"]))
 
             _after_frame, after = self._vision_snapshot(area)
@@ -872,6 +1222,22 @@ class HearthstoneBot:
             else:
                 failed.clear()
 
+    def _cancel_attack_selection(self, area: ClientArea) -> None:
+        """Clear a minion that Hearthstone kept selected after a missed drag."""
+        self._click(self._point(area, "attack_cancel"))
+        self._sleep(float(self.config["vision"]["attack_cancel_wait_seconds"]))
+
+    def _click_attack_target(
+        self,
+        area: ClientArea,
+        attacker: tuple[int, int],
+        target: tuple[int, int],
+    ) -> None:
+        """Fallback to Hearthstone's reliable click-source, click-target input."""
+        self._click(attacker)
+        self._sleep(float(self.config["vision"]["attack_click_gap_seconds"]))
+        self._click(target)
+
     def _attack_highlighted_characters(self, area: ClientArea) -> None:
         vision_config = self.config["vision"]
         failed: list[tuple[int, int]] = []
@@ -883,6 +1249,12 @@ class HearthstoneBot:
             if self._stop_event.is_set():
                 return
             _frame, snapshot = self._vision_snapshot(area)
+            now = time.monotonic()
+            self._blocked_attackers = {
+                x: expires_at
+                for x, expires_at in self._blocked_attackers.items()
+                if expires_at > now
+            }
             available = [
                 item
                 for item in snapshot.attackers
@@ -890,24 +1262,76 @@ class HearthstoneBot:
                     abs(item.center[0] - failed_point[0]) <= failure_distance
                     for failed_point in failed
                 )
+                and not any(
+                    abs(item.center[0] - blocked_x) <= failure_distance
+                    for blocked_x in self._blocked_attackers
+                )
             ]
             if not available:
                 return
             attacker = min(available, key=lambda item: item.center[0])
+            # This snapshot is captured immediately before every attack. Taunts may
+            # appear or disappear after the previous combat, so never reuse a target.
+            target = snapshot.taunts[0].center if snapshot.taunts else enemy_hero
             self._set_states(bot=f"Bot is running: attacking ({len(available)})")
-            self._drag(attacker.center, enemy_hero)
+            LOGGER.info(
+                "Attacking from %s to %s%s",
+                attacker.center,
+                target,
+                " (Taunt)" if snapshot.taunts else " (enemy hero)",
+            )
+            self._drag(attacker.center, target, area)
             self._sleep(float(vision_config["after_attack_wait_seconds"]))
 
+            # A missed release can leave the attacker selected. While selected its
+            # normal green outline disappears, which used to look like a successful
+            # attack. An empty-board click restores a truthful visual state.
+            self._cancel_attack_selection(area)
             _after_frame, after = self._vision_snapshot(area)
             if not self._item_near(after.attackers, attacker.center, failure_distance):
                 failed.clear()
                 continue
-            # Do not sweep random target positions: one failed face attack is skipped.
+
+            retry_attacker = min(
+                after.attackers,
+                key=lambda item: abs(item.center[0] - attacker.center[0]),
+            )
+            retry_target = (
+                after.taunts[0].center
+                if after.taunts
+                else self._point(area, "enemy_hero")
+            )
+            LOGGER.info(
+                "Attack did not resolve; retrying with clicks: %s -> %s%s",
+                retry_attacker.center,
+                retry_target,
+                " (Taunt)" if after.taunts else " (enemy hero)",
+            )
+            self._click_attack_target(
+                area,
+                retry_attacker.center,
+                retry_target,
+            )
+            self._sleep(float(vision_config["after_attack_wait_seconds"]))
+            self._cancel_attack_selection(area)
+            _retry_frame, retry_after = self._vision_snapshot(area)
+            if not self._item_near(
+                retry_after.attackers,
+                retry_attacker.center,
+                failure_distance,
+            ):
+                failed.clear()
+                continue
+
+            LOGGER.info("Attack retry did not resolve; skipping this attacker")
             failed.append(attacker.center)
+            self._blocked_attackers[attacker.center[0]] = time.monotonic() + float(
+                vision_config["failed_attack_cooldown_seconds"]
+            )
 
     def _use_hero_power_if_available(self, area: ClientArea) -> bool:
         frame, snapshot = self._vision_snapshot(area)
-        if not snapshot.board_visible:
+        if not snapshot.board_visible or snapshot.playable_cards:
             return False
         hero_power_ratio = self._vision.green_ratio_at_point(
             frame,
@@ -925,6 +1349,25 @@ class HearthstoneBot:
         self._sleep(float(self.config["vision"]["after_card_wait_seconds"]))
         return True
 
+    def _maybe_click_empty_board(self, area: ClientArea) -> bool:
+        """Occasionally dismiss harmless overlays while no action is available."""
+        now = time.monotonic()
+        if self._next_idle_click_at <= 0.0:
+            minimum = float(self.config["behavior"]["idle_click_min_seconds"])
+            maximum = float(self.config["behavior"]["idle_click_max_seconds"])
+            self._next_idle_click_at = now + random.uniform(minimum, maximum)
+            return False
+        if now < self._next_idle_click_at:
+            return False
+
+        minimum = float(self.config["behavior"]["idle_click_min_seconds"])
+        maximum = float(self.config["behavior"]["idle_click_max_seconds"])
+        self._next_idle_click_at = now + random.uniform(minimum, maximum)
+        self._set_states(bot="Bot is running: idle board click")
+        self._click(self._point(area, "idle_board"))
+        LOGGER.info("No action detected; clicked an empty board area")
+        return True
+
     def _take_visual_turn(
         self,
         area: ClientArea,
@@ -937,18 +1380,23 @@ class HearthstoneBot:
         if self._stop_event.is_set():
             return
 
-        # Try after cards and, if it was not available, once more after attacks.
-        # Remembering a successful click also avoids a second click during animation.
-        hero_power_used = self._use_hero_power_if_available(area)
-        if self._stop_event.is_set():
-            return
+        # Cards and minion attacks have priority over Hero Power. This prevents a
+        # failed card drag from turning into an unrelated click on the ability.
         self._attack_highlighted_characters(area)
         if self._stop_event.is_set():
             return
-        if not hero_power_used:
-            self._use_hero_power_if_available(area)
+        self._use_hero_power_if_available(area)
         if self._stop_event.is_set():
             return
+
+        # End Turn is yellow while useful actions may still exist and becomes green
+        # when the game considers the turn complete. Always capture a fresh frame:
+        # a card play, Hero Power, or attack may have changed the button state.
+        _final_frame, final_snapshot = self._vision_snapshot(area)
+        if not final_snapshot.turn_active:
+            self._set_states(bot="Bot is running: waiting for green End Turn")
+            return
+
         self._set_states(bot="Bot is running: ending the turn")
         self._click(
             self._point(area, "end_turn"),
@@ -995,6 +1443,18 @@ class HearthstoneBot:
         now = time.monotonic()
         if now < self._next_actions_at:
             self._sleep(min(1.0, self._next_actions_at - now))
+            return
+
+        if snapshot.main_menu_visible:
+            self._set_states(bot="Bot is running: opening Hearthstone mode")
+            self._click(
+                self._point(area, "main_menu_hearthstone"),
+                float(self.config["behavior"]["navigation_click_hold_seconds"]),
+            )
+            self._next_actions_at = time.monotonic() + float(
+                self.config["vision"]["after_menu_click_wait_seconds"]
+            )
+            LOGGER.info("Main menu recognized; clicked Hearthstone")
             return
 
         if snapshot.result_visible:
@@ -1046,7 +1506,11 @@ class HearthstoneBot:
         ):
             self._take_visual_turn(area, frame, snapshot)
         else:
-            self._set_states(bot="Bot is running: waiting for a recognized screen")
+            if snapshot.board_visible:
+                if not self._maybe_click_empty_board(area):
+                    self._set_states(bot="Bot is running: waiting for an action")
+            else:
+                self._set_states(bot="Bot is running: waiting for a recognized screen")
         self._sleep(float(self.config["vision"]["scan_interval_seconds"]))
 
     def _run(self) -> None:
@@ -1116,12 +1580,15 @@ class BotGui:
     def __init__(self, config: dict) -> None:
         self.root = tk.Tk()
         self.root.title("Hearthstone Simple Bot")
-        self.root.geometry("380x230")
+        self.root.geometry("380x270")
         self.root.resizable(False, False)
         self.root.configure(bg="#171b22")
 
         self.game_text = tk.StringVar(value="Game is not running")
         self.bot_text = tk.StringVar(value="Bot is stopped")
+        self.auto_launch_var = tk.BooleanVar(
+            value=bool(config["game"].get("auto_launch", True))
+        )
         self.bot = HearthstoneBot(config, lambda: None)
         self.hotkey = GlobalCtrlCHotkey(self._hotkey_stop)
 
@@ -1150,7 +1617,23 @@ class BotGui:
             fg="#9aa4b2",
             bg="#171b22",
         )
-        self.bot_label.pack(pady=(4, 15))
+        self.bot_label.pack(pady=(4, 10))
+
+        self.auto_launch_button = tk.Checkbutton(
+            self.root,
+            text="Auto-launch Hearthstone",
+            variable=self.auto_launch_var,
+            command=self._set_auto_launch,
+            onvalue=True,
+            offvalue=False,
+            bg="#171b22",
+            fg="#d7dde7",
+            activebackground="#171b22",
+            activeforeground="white",
+            selectcolor="#2e9b62",
+            font=("Segoe UI", 10),
+        )
+        self.auto_launch_button.pack(pady=(0, 12))
 
         buttons = tk.Frame(self.root, bg="#171b22")
         buttons.pack()
@@ -1214,6 +1697,9 @@ class BotGui:
     def _hotkey_stop(self) -> None:
         # Event.set and the protected text state are safe outside Tk's main thread.
         self.bot.stop()
+
+    def _set_auto_launch(self) -> None:
+        self.bot.set_auto_launch(self.auto_launch_var.get())
 
     def start(self) -> None:
         LOGGER.info("Bot started by the user")

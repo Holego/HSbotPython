@@ -1,5 +1,6 @@
 {
   "game": {
+    "auto_launch": true,
     "process_names": [
       "Hearthstone.exe"
     ],
@@ -17,9 +18,20 @@
     "drag_duration": 0.55,
     "drag_hold_before_seconds": 0.25,
     "drag_hold_after_seconds": 0.2,
+    "timing_jitter_fraction": 0.15,
+    "click_jitter_ratio": [0.002, 0.002],
+    "drag_source_jitter_ratio": [0.002, 0.002],
+    "drag_target_jitter_ratio": [0.008, 0.008],
+    "drag_curve_min_ratio": 0.02,
+    "drag_curve_ratio": 0.06,
+    "drag_steps_min": 12,
+    "drag_steps_max": 18,
+    "drag_step_noise_pixels": 1.5,
     "screen_change_wait": 3.0,
     "mulligan_wait_seconds": 8.0,
     "error_retry_seconds": 2.0,
+    "idle_click_min_seconds": 8.0,
+    "idle_click_max_seconds": 15.0,
     "launch_retry_seconds": 20.0,
     "template_confidence": 0.82
   },
@@ -28,6 +40,9 @@
     "after_menu_click_wait_seconds": 5.0,
     "after_card_wait_seconds": 0.55,
     "after_attack_wait_seconds": 0.45,
+    "attack_cancel_wait_seconds": 0.2,
+    "attack_click_gap_seconds": 0.18,
+    "failed_attack_cooldown_seconds": 20.0,
     "after_end_turn_wait_seconds": 2.0,
     "result_click_wait_seconds": 2.5,
     "error_click_wait_seconds": 3.0,
@@ -46,6 +61,19 @@
       "lower": [14, 105, 175],
       "upper": [42, 255, 255]
     },
+    "end_button_hsv": {
+      "lower": [8, 40, 100],
+      "upper": [45, 255, 255]
+    },
+    "taunt_shield_hsv": {
+      "lower": [85, 0, 55],
+      "upper": [130, 70, 220]
+    },
+    "main_menu_button_hsv": {
+      "lower": [0, 0, 120],
+      "upper": [179, 90, 255]
+    },
+    "main_menu_roi": [0.38, 0.25, 0.62, 0.61],
     "play_roi": [0.64, 0.74, 0.79, 0.97],
     "mulligan_roi": [0.42, 0.7, 0.58, 0.88],
     "result_left_roi": [0.12, 0.1, 0.3, 0.8],
@@ -54,17 +82,29 @@
     "end_turn_roi": [0.735, 0.39, 0.84, 0.53],
     "hand_roi": [0.3, 0.84, 0.65, 0.999],
     "own_board_roi": [0.25, 0.46, 0.72, 0.67],
+    "enemy_taunt_roi": [0.25, 0.39, 0.75, 0.49],
     "play_color_ratio": 0.155,
     "mulligan_color_ratio": 0.1,
     "result_gray_saturation_max": 35,
     "result_gray_ratio": 0.5,
     "error_dialog_gray_ratio": 0.5,
     "board_button_color_ratio": 0.08,
+    "end_turn_warm_ratio": 0.12,
     "end_turn_green_ratio": 0.12,
     "hero_power_radius": [0.05, 0.07],
     "hero_power_green_ratio": 0.09,
     "hand_item_min_width_ratio": 0.04,
     "board_item_min_width_ratio": 0.018,
+    "attacker_min_width_ratio": 0.035,
+    "attacker_min_height_ratio": 0.065,
+    "attacker_min_aspect_ratio": 0.85,
+    "attacker_border_thickness_ratio": 0.2,
+    "attacker_min_border_green_ratio": 0.21,
+    "attacker_group_min_width_ratio": 0.1,
+    "attacker_group_max_width_ratio": 0.5,
+    "attacker_group_margin_ratio": 0.035,
+    "attacker_spacing_ratio": 0.066,
+    "attacker_debug_width_ratio": 0.07,
     "item_max_width_ratio": 0.14,
     "item_min_height_ratio": 0.035,
     "item_max_height_ratio": 0.3,
@@ -74,16 +114,32 @@
     "hand_card_spacing_ratio": 0.052,
     "hand_card_width_ratio": 0.07,
     "hand_source_y_ratio": 0.91,
-    "failure_distance_ratio": 0.025
+    "failure_distance_ratio": 0.025,
+    "taunt_min_width_ratio": 0.025,
+    "taunt_max_width_ratio": 0.05,
+    "taunt_min_height_ratio": 0.02,
+    "taunt_max_height_ratio": 0.055,
+    "taunt_min_area_ratio": 0.00045,
+    "enemy_minion_target_y_ratio": 0.37,
+    "main_menu_button_min_width_ratio": 0.11,
+    "main_menu_button_max_width_ratio": 0.22,
+    "main_menu_button_min_height_ratio": 0.02,
+    "main_menu_button_max_height_ratio": 0.08,
+    "main_menu_button_min_aspect_ratio": 4.0,
+    "main_menu_button_min_area_ratio": 0.0015,
+    "main_menu_min_button_count": 3
   },
   "points": {
     "play": [0.716, 0.825],
     "mulligan_confirm": [0.5, 0.79],
     "result_continue": [0.5, 0.92],
     "error_ok": [0.5, 0.61],
+    "main_menu_hearthstone": [0.5, 0.31],
     "board_play": [0.5, 0.6],
     "enemy_hero": [0.5, 0.2],
     "hero_power": [0.586, 0.77],
+    "idle_board": [0.34, 0.72],
+    "attack_cancel": [0.34, 0.72],
     "end_turn": [0.79, 0.457]
   }
 }
