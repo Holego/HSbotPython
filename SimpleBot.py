@@ -264,6 +264,7 @@ class VisionItem:
 @dataclass(frozen=True)
 class VisionSnapshot:
     main_menu_visible: bool
+    reconnect_visible: bool
     board_visible: bool
     result_visible: bool
     error_visible: bool
@@ -762,6 +763,17 @@ class ScreenVision:
             + self._low_saturation_ratio(frame, "result_right_roi")
         ) / 2.0
         result_visible = result_gray >= float(self.config["result_gray_ratio"])
+        reconnect_left = self._color_ratio(
+            frame, "reconnect_left_roi", "end_button_hsv"
+        )
+        reconnect_right = self._color_ratio(
+            frame, "reconnect_right_roi", "end_button_hsv"
+        )
+        reconnect_visible = (
+            result_visible
+            and min(reconnect_left, reconnect_right)
+            >= float(self.config["reconnect_button_ratio"])
+        )
         error_gray = self._low_saturation_ratio(frame, "error_dialog_roi")
         error_visible = (
             not result_visible
@@ -790,6 +802,7 @@ class ScreenVision:
         )
         return VisionSnapshot(
             main_menu_visible=main_menu_visible,
+            reconnect_visible=reconnect_visible,
             board_visible=board_visible,
             result_visible=result_visible,
             error_visible=error_visible,
@@ -844,6 +857,7 @@ class ScreenVision:
             )
         state_text = (
             f"MAIN={int(snapshot.main_menu_visible)} "
+            f"RECONNECT={int(snapshot.reconnect_visible)} "
             f"BOARD={int(snapshot.board_visible)} "
             f"RESULT={int(snapshot.result_visible)} "
             f"ERROR={int(snapshot.error_visible)} "
@@ -1455,6 +1469,18 @@ class HearthstoneBot:
                 self.config["vision"]["after_menu_click_wait_seconds"]
             )
             LOGGER.info("Main menu recognized; clicked Hearthstone")
+            return
+
+        if snapshot.reconnect_visible:
+            self._set_states(bot="Bot is running: reconnecting")
+            self._click(
+                self._point(area, "reconnect_confirm"),
+                float(self.config["behavior"]["navigation_click_hold_seconds"]),
+            )
+            self._next_actions_at = time.monotonic() + float(
+                self.config["vision"]["reconnect_click_wait_seconds"]
+            )
+            LOGGER.info("Offline dialog recognized; clicked Reconnect")
             return
 
         if snapshot.result_visible:

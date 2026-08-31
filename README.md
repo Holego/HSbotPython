@@ -11,6 +11,7 @@ A simple computer-vision bot for Hearthstone on Windows. It can:
 - find the green glow around playable cards and play only detected cards;
 - find fully highlighted minions, attack Taunt minions before the enemy hero, use an available Hero Power, and finish the active turn;
 - end turns, start the next match, and handle disconnect dialogs;
+- recognize the offline dialog and click **Reconnect** instead of **Cancel**;
 - close the match-start error dialog by clicking its `OK` button;
 - stop through the **Stop** button or the global `Ctrl+C` hotkey.
 
