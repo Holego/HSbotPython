@@ -271,6 +271,7 @@ class VisionSnapshot:
     mulligan_visible: bool
     play_visible: bool
     turn_active: bool
+    hero_power_active: bool
     playable_cards: tuple[VisionItem, ...]
     attackers: tuple[VisionItem, ...]
     taunts: tuple[VisionItem, ...]
@@ -738,6 +739,63 @@ class ScreenVision:
         targets.sort(key=lambda item: item.center[0])
         return tuple(targets)
 
+    def _enemy_minion_targets(
+        self,
+        frame: np.ndarray,
+        area: ClientArea,
+    ) -> tuple[VisionItem, ...]:
+        """Find occupied enemy minion slots for a failed face-attack fallback."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(
+            gray,
+            int(self.config["enemy_edge_canny_low"]),
+            int(self.config["enemy_edge_canny_high"]),
+        )
+        frame_height, frame_width = frame.shape[:2]
+        start = float(self.config["enemy_slot_start_ratio"])
+        end = float(self.config["enemy_slot_end_ratio"])
+        count = int(self.config["enemy_slot_probe_count"])
+        radius = float(self.config["enemy_slot_probe_radius_ratio"])
+        top = round(frame_height * float(self.config["enemy_slot_probe_top_ratio"]))
+        bottom = round(
+            frame_height * float(self.config["enemy_slot_probe_bottom_ratio"])
+        )
+        minimum = float(self.config["enemy_slot_min_edge_ratio"])
+        target_y = area.top + round(
+            area.height * float(self.config["enemy_minion_target_y_ratio"])
+        )
+
+        probes: list[tuple[float, float, tuple[int, int, int, int]]] = []
+        for index in range(count):
+            x_ratio = start + (end - start) * index / max(1, count - 1)
+            left = max(0, round(frame_width * (x_ratio - radius)))
+            right = min(frame_width, round(frame_width * (x_ratio + radius)))
+            patch = edges[top:bottom, left:right]
+            edge_ratio = float(np.mean(patch > 0)) if patch.size else 0.0
+            probes.append(
+                (x_ratio, edge_ratio, (left, top, right - left, bottom - top))
+            )
+
+        spacing = float(self.config["enemy_slot_min_spacing_ratio"])
+        selected: list[tuple[float, float, tuple[int, int, int, int]]] = []
+        for probe in sorted(probes, key=lambda item: item[1], reverse=True):
+            x_ratio, score, _box = probe
+            if score < minimum:
+                break
+            if any(abs(x_ratio - chosen[0]) < spacing for chosen in selected):
+                continue
+            selected.append(probe)
+
+        targets: list[VisionItem] = []
+        for x_ratio, _score, box in sorted(selected, key=lambda item: item[0]):
+            targets.append(
+                VisionItem(
+                    center=(area.left + round(area.width * x_ratio), target_y),
+                    box=(area.left + box[0], area.top + box[1], box[2], box[3]),
+                )
+            )
+        return tuple(targets)
+
     def green_ratio_at_point(
         self,
         frame: np.ndarray,
@@ -800,6 +858,15 @@ class ScreenVision:
             and not attackers
             and mulligan_blue >= float(self.config["mulligan_color_ratio"])
         )
+        hero_power_active = (
+            board_visible
+            and self.green_ratio_at_point(
+                frame,
+                self.config["hero_power_point"],
+                self.config["hero_power_radius"],
+            )
+            >= float(self.config["hero_power_green_ratio"])
+        )
         return VisionSnapshot(
             main_menu_visible=main_menu_visible,
             reconnect_visible=reconnect_visible,
@@ -817,6 +884,7 @@ class ScreenVision:
             ),
             turn_active=end_green
             >= float(self.config["end_turn_green_ratio"]),
+            hero_power_active=hero_power_active,
             playable_cards=playable_cards,
             attackers=attackers,
             taunts=(self._taunt_targets(frame, area) if board_visible else ()),
@@ -864,6 +932,7 @@ class ScreenVision:
             f"MULLIGAN={int(snapshot.mulligan_visible)} "
             f"PLAY={int(snapshot.play_visible)} "
             f"TURN={int(snapshot.turn_active)} "
+            f"POWER={int(snapshot.hero_power_active)} "
             f"CARDS={len(snapshot.playable_cards)} "
             f"ATTACKERS={len(snapshot.attackers)} TAUNTS={len(snapshot.taunts)}"
         )
@@ -968,19 +1037,30 @@ class HearthstoneBot:
 
     def _launch_game(self) -> None:
         game_config = self.config["game"]
-        executable = str(game_config.get("executable", "")).strip()
         try:
-            if executable:
-                executable_path = Path(executable).expanduser()
-                if not executable_path.is_file():
-                    raise FileNotFoundError(executable_path)
-                subprocess.Popen([str(executable_path)])
-                LOGGER.info("Started Hearthstone: %s", executable_path)
-            elif os.name == "nt":
-                os.startfile(game_config.get("launch_uri", "battlenet://WTCG"))
-                LOGGER.info("Sent the launch command through Battle.net")
-            else:
+            if os.name != "nt":
                 raise RuntimeError("automatic launch is supported only on Windows")
+            configured = str(game_config.get("executable", "")).strip()
+            candidates: list[Path] = []
+            if configured:
+                candidates.append(Path(configured).expanduser())
+            for environment_name in ("ProgramFiles(x86)", "ProgramFiles"):
+                root = os.environ.get(environment_name)
+                if root:
+                    candidates.append(Path(root) / "Hearthstone" / "Hearthstone.exe")
+            executable_path = next(
+                (path for path in candidates if path.is_file()),
+                None,
+            )
+            if executable_path is None:
+                raise FileNotFoundError(
+                    "Hearthstone.exe was not found; set game.executable in bot_config.json"
+                )
+            subprocess.Popen(
+                [str(executable_path)],
+                cwd=str(executable_path.parent),
+            )
+            LOGGER.info("Started Hearthstone executable: %s", executable_path)
         except (OSError, RuntimeError) as exc:
             LOGGER.error("Could not start the game: %s", exc)
             self._set_states(game="Game launch failed — see hs_bot.log")
@@ -1262,7 +1342,7 @@ class HearthstoneBot:
         for _attempt in range(max_attempts):
             if self._stop_event.is_set():
                 return
-            _frame, snapshot = self._vision_snapshot(area)
+            frame, snapshot = self._vision_snapshot(area)
             now = time.monotonic()
             self._blocked_attackers = {
                 x: expires_at
@@ -1286,13 +1366,27 @@ class HearthstoneBot:
             attacker = min(available, key=lambda item: item.center[0])
             # This snapshot is captured immediately before every attack. Taunts may
             # appear or disappear after the previous combat, so never reuse a target.
-            target = snapshot.taunts[0].center if snapshot.taunts else enemy_hero
+            crowded_targets = self._vision._enemy_minion_targets(frame, area)
+            if snapshot.taunts:
+                target = snapshot.taunts[0].center
+                target_label = "Taunt"
+            elif len(crowded_targets) >= int(
+                vision_config["crowded_enemy_minion_count"]
+            ):
+                # On a full enemy row, shield artwork becomes too small and may merge
+                # with adjacent frames. Prefer a legal minion candidate over face;
+                # unresolved candidates are checked sequentially below.
+                target = crowded_targets[0].center
+                target_label = "crowded enemy board"
+            else:
+                target = enemy_hero
+                target_label = "enemy hero"
             self._set_states(bot=f"Bot is running: attacking ({len(available)})")
             LOGGER.info(
-                "Attacking from %s to %s%s",
+                "Attacking from %s to %s (%s)",
                 attacker.center,
                 target,
-                " (Taunt)" if snapshot.taunts else " (enemy hero)",
+                target_label,
             )
             self._drag(attacker.center, target, area)
             self._sleep(float(vision_config["after_attack_wait_seconds"]))
@@ -1301,39 +1395,67 @@ class HearthstoneBot:
             # normal green outline disappears, which used to look like a successful
             # attack. An empty-board click restores a truthful visual state.
             self._cancel_attack_selection(area)
-            _after_frame, after = self._vision_snapshot(area)
+            after_frame, after = self._vision_snapshot(area)
             if not self._item_near(after.attackers, attacker.center, failure_distance):
                 failed.clear()
                 continue
 
-            retry_attacker = min(
-                after.attackers,
-                key=lambda item: abs(item.center[0] - attacker.center[0]),
-            )
-            retry_target = (
-                after.taunts[0].center
-                if after.taunts
-                else self._point(area, "enemy_hero")
-            )
-            LOGGER.info(
-                "Attack did not resolve; retrying with clicks: %s -> %s%s",
-                retry_attacker.center,
-                retry_target,
-                " (Taunt)" if after.taunts else " (enemy hero)",
-            )
-            self._click_attack_target(
-                area,
-                retry_attacker.center,
-                retry_target,
-            )
-            self._sleep(float(vision_config["after_attack_wait_seconds"]))
-            self._cancel_attack_selection(area)
-            _retry_frame, retry_after = self._vision_snapshot(area)
-            if not self._item_near(
-                retry_after.attackers,
-                retry_attacker.center,
-                failure_distance,
-            ):
+            if after.taunts:
+                retry_targets = [
+                    (item.center, "Taunt") for item in after.taunts
+                ]
+            elif snapshot.taunts:
+                retry_targets = [
+                    (item.center, "Taunt") for item in snapshot.taunts
+                ]
+            else:
+                # A failed face attack often means a compressed or unusually colored
+                # Taunt shield escaped the strict detector. Locate occupied enemy
+                # slots and try them in order until Hearthstone accepts the target.
+                enemy_minions = self._vision._enemy_minion_targets(after_frame, area)
+                retry_targets = [
+                    (item.center, "enemy minion fallback")
+                    for item in enemy_minions[
+                        : int(vision_config["max_enemy_target_retries"])
+                    ]
+                ]
+                if not retry_targets:
+                    retry_targets = [(self._point(area, "enemy_hero"), "enemy hero")]
+
+            resolved = False
+            retry_after = after
+            for retry_target, target_label in retry_targets:
+                matching_attackers = [
+                    item
+                    for item in retry_after.attackers
+                    if abs(item.center[0] - attacker.center[0]) <= failure_distance
+                ]
+                if not matching_attackers:
+                    resolved = True
+                    break
+                retry_attacker = min(
+                    matching_attackers,
+                    key=lambda item: abs(item.center[0] - attacker.center[0]),
+                )
+                LOGGER.info(
+                    "Attack did not resolve; retrying with clicks: %s -> %s (%s)",
+                    retry_attacker.center,
+                    retry_target,
+                    target_label,
+                )
+                self._click_attack_target(area, retry_attacker.center, retry_target)
+                self._sleep(float(vision_config["after_attack_wait_seconds"]))
+                self._cancel_attack_selection(area)
+                _retry_frame, retry_after = self._vision_snapshot(area)
+                if not self._item_near(
+                    retry_after.attackers,
+                    retry_attacker.center,
+                    failure_distance,
+                ):
+                    resolved = True
+                    break
+
+            if resolved:
                 failed.clear()
                 continue
 
@@ -1527,6 +1649,7 @@ class HearthstoneBot:
         if snapshot.board_visible and (
             snapshot.playable_cards
             or snapshot.attackers
+            or snapshot.hero_power_active
             or snapshot.turn_active
             or template_turn
         ):

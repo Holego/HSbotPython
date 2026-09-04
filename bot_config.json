@@ -7,7 +7,6 @@
     "window_titles": [
       "Hearthstone"
     ],
-    "launch_uri": "battlenet://WTCG",
     "executable": ""
   },
   "behavior": {
@@ -96,7 +95,8 @@
     "end_turn_warm_ratio": 0.12,
     "end_turn_green_ratio": 0.12,
     "hero_power_radius": [0.05, 0.07],
-    "hero_power_green_ratio": 0.09,
+    "hero_power_point": [0.586, 0.77],
+    "hero_power_green_ratio": 0.07,
     "hand_item_min_width_ratio": 0.04,
     "board_item_min_width_ratio": 0.018,
     "attacker_min_width_ratio": 0.035,
@@ -125,6 +125,18 @@
     "taunt_max_height_ratio": 0.055,
     "taunt_min_area_ratio": 0.00045,
     "enemy_minion_target_y_ratio": 0.37,
+    "enemy_slot_start_ratio": 0.3,
+    "enemy_slot_end_ratio": 0.7,
+    "enemy_slot_probe_count": 13,
+    "enemy_slot_probe_radius_ratio": 0.025,
+    "enemy_slot_probe_top_ratio": 0.3,
+    "enemy_slot_probe_bottom_ratio": 0.47,
+    "enemy_slot_min_edge_ratio": 0.08,
+    "enemy_slot_min_spacing_ratio": 0.05,
+    "enemy_edge_canny_low": 70,
+    "enemy_edge_canny_high": 150,
+    "max_enemy_target_retries": 7,
+    "crowded_enemy_minion_count": 4,
     "main_menu_button_min_width_ratio": 0.11,
     "main_menu_button_max_width_ratio": 0.22,
     "main_menu_button_min_height_ratio": 0.02,
