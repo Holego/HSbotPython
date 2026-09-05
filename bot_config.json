@@ -31,7 +31,8 @@
     "error_retry_seconds": 2.0,
     "idle_click_min_seconds": 8.0,
     "idle_click_max_seconds": 15.0,
-    "launch_retry_seconds": 20.0,
+    "launch_retry_min_seconds": 180.0,
+    "launch_retry_max_seconds": 300.0,
     "template_confidence": 0.82
   },
   "vision": {
@@ -44,8 +45,8 @@
     "failed_attack_cooldown_seconds": 20.0,
     "after_end_turn_wait_seconds": 2.0,
     "result_click_wait_seconds": 2.5,
-    "reconnect_click_wait_seconds": 5.0,
-    "error_click_wait_seconds": 3.0,
+    "reconnect_click_wait_seconds": 15.0,
+    "error_click_wait_seconds": 15.0,
     "max_cards_per_turn": 12,
     "max_attacks_per_turn": 10,
     "save_debug_image": true,

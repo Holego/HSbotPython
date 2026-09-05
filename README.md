@@ -88,7 +88,7 @@ Without `play.png`, the bot recognizes the Play button by its blue glow. Templat
 
 ## Automatic game launch
 
-The **Auto-launch Hearthstone** checkbox is enabled by default. While the bot is running, it relaunches the game if `Hearthstone.exe` closes. Clear the checkbox to keep the bot waiting without launching the game.
+The **Auto-launch Hearthstone** checkbox is enabled by default. While the bot is running, it launches the game only when the `Hearthstone.exe` process is absent. The first attempt is immediate; if the process remains absent, another attempt is made after a random 3–5 minute delay to avoid a rapid launch loop. Clear the checkbox to keep the bot waiting without launching the game.
 
 The bot starts `Hearthstone.exe` directly. It automatically checks the standard `Program Files (x86)\Hearthstone` and `Program Files\Hearthstone` locations. For a custom installation directory, set the full executable path in the `game.executable` field of `bot_config.json`.
 

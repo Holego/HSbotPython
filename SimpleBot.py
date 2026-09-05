@@ -827,14 +827,18 @@ class ScreenVision:
         reconnect_right = self._color_ratio(
             frame, "reconnect_right_roi", "end_button_hsv"
         )
+        error_gray = self._low_saturation_ratio(frame, "error_dialog_roi")
         reconnect_visible = (
-            result_visible
+            (
+                result_visible
+                or error_gray >= float(self.config["error_dialog_gray_ratio"])
+            )
             and min(reconnect_left, reconnect_right)
             >= float(self.config["reconnect_button_ratio"])
         )
-        error_gray = self._low_saturation_ratio(frame, "error_dialog_roi")
         error_visible = (
             not result_visible
+            and not reconnect_visible
             and error_gray >= float(self.config["error_dialog_gray_ratio"])
         )
         playable_cards = self._green_items(frame, area, "hand_roi")
@@ -964,7 +968,7 @@ class HearthstoneBot:
             TEMPLATE_DIR, float(config["behavior"]["template_confidence"])
         )
         self._vision = ScreenVision(config["vision"])
-        self._last_launch_attempt = 0.0
+        self._next_launch_attempt_at = 0.0
         self._next_actions_at = 0.0
         self._next_idle_click_at = 0.0
         self._auto_launch = bool(config["game"].get("auto_launch", True))
@@ -1072,11 +1076,26 @@ class HearthstoneBot:
             if not auto_launch:
                 self._set_states(game="Game is not running — auto-launch is off")
                 return None
-            self._set_states(game="Game is not running — starting it...")
-            retry = float(self.config["behavior"]["launch_retry_seconds"])
-            if time.monotonic() - self._last_launch_attempt >= retry:
-                self._last_launch_attempt = time.monotonic()
+            now = time.monotonic()
+            if now >= self._next_launch_attempt_at:
+                retry_min = float(
+                    self.config["behavior"]["launch_retry_min_seconds"]
+                )
+                retry_max = float(
+                    self.config["behavior"]["launch_retry_max_seconds"]
+                )
+                if retry_max < retry_min:
+                    retry_min, retry_max = retry_max, retry_min
+                self._next_launch_attempt_at = now + random.uniform(
+                    retry_min, retry_max
+                )
+                self._set_states(game="Game is not running — starting it...")
                 self._launch_game()
+            else:
+                remaining = max(1, round(self._next_launch_attempt_at - now))
+                self._set_states(
+                    game=f"Game is not running — retry in {remaining} seconds"
+                )
             return None
 
         hwnd = self._window.find()
@@ -1549,6 +1568,13 @@ class HearthstoneBot:
         _hwnd, area = game
         frame, snapshot = self._vision_snapshot(area)
 
+        # Screen buttons must obey the same cooldown as game actions. Otherwise a
+        # dialog that remains visible can be clicked once per scan indefinitely.
+        now = time.monotonic()
+        if now < self._next_actions_at:
+            self._sleep(min(1.0, self._next_actions_at - now))
+            return
+
         # The match-start error leaves the blue Play button visible behind a modal.
         # Handle the gray dialog first so the background button is never clicked.
         if snapshot.error_visible:
@@ -1574,11 +1600,6 @@ class HearthstoneBot:
                 self._next_actions_at = time.monotonic() + float(
                     self.config["behavior"]["mulligan_wait_seconds"]
                 )
-            return
-
-        now = time.monotonic()
-        if now < self._next_actions_at:
-            self._sleep(min(1.0, self._next_actions_at - now))
             return
 
         if snapshot.main_menu_visible:
